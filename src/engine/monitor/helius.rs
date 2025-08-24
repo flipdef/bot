@@ -1,7 +1,7 @@
 // src/engine/monitor/helius.rs
 // Monitor Pump.fun optimizado para Helius Streams (Enhanced WS):
 // - WS usa transactionSubscribe (atlas-mainnet) y NO hace llamadas RPC por tx.
-// - Polling queda como fallback.
+// - Polling queda como fallback (usa RPC normal).
 
 use futures::{SinkExt, StreamExt};
 
@@ -14,7 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use bs58;
+use bs58; // usado en fallback para discriminar create
 use serde_json::Value;
 use solana_client::{
     nonblocking::rpc_client::RpcClient as NbRpcClient,
@@ -127,36 +127,6 @@ fn contains_create(logs: &[String]) -> bool {
     })
 }
 
-fn extract_mint_creator_from_encoded(enc_tx: &EncodedTransaction, disc_create: &[u8; 8]) -> Option<(Pubkey, Pubkey)> {
-    match enc_tx {
-        EncodedTransaction::Json(ui_tx) => match &ui_tx.message {
-            UiMessage::Raw(raw) => {
-                let creator = raw.account_keys.first()?.parse::<Pubkey>().ok()?;
-                let mut mint: Option<Pubkey> = None;
-                for ix in &raw.instructions {
-                    let prog_id = raw.account_keys.get(ix.program_id_index as usize)?;
-                    if prog_id != &PUMP_PROGRAM { continue; }
-                    if let Ok(bytes) = bs58::decode(&ix.data).into_vec() {
-                        if bytes.len() >= 8 && bytes[..8] == *disc_create {
-                            if let Some(&acc0) = ix.accounts.first() {
-                                mint = raw.account_keys.get(acc0 as usize).and_then(|s| s.parse::<Pubkey>().ok());
-                            }
-                            break;
-                        }
-                    }
-                }
-                mint.map(|m| (m, creator))
-            }
-            UiMessage::Parsed(parsed) => {
-                let creator = parsed.account_keys.first().and_then(|k| k.pubkey.parse().ok())?;
-                let mint = parsed.account_keys.get(0).and_then(|k| k.pubkey.parse().ok())?;
-                Some((mint, creator))
-            }
-        },
-        _ => None,
-    }
-}
-
 fn v_as_str(v: &Value) -> Option<&str> { v.as_str() }
 fn v_get<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
     let mut cur = v;
@@ -164,28 +134,13 @@ fn v_get<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
     Some(cur)
 }
 
-fn decode_b58_prefix8(data_b58: &str) -> Option<[u8; 8]> {
-    let bytes = bs58::decode(data_b58).into_vec().ok()?;
-    if bytes.len() < 8 { return None; }
-    let mut out = [0u8; 8];
-    out.copy_from_slice(&bytes[..8]);
-    Some(out)
-}
-
-/// Extrae (signature, mint, creator) desde un mensaje JSON de transactionSubscribe (jsonParsed o raw).
-/// Extrae (signature, mint, creator) usando el patrón documentado por Helius para pump.fun:
-///  - Filtro por log `Instruction: InitializeMint2` en `meta.logMessages`
-///  - `accountKeys[0]` = creator, `accountKeys[1]` = mint
+/// Extrae (signature, mint, creator) de `transactionNotification` (Streams). Detecta por SPL InitializeMint*.
 fn parse_helius_stream_create(msg: &Value, _disc_create: &[u8; 8]) -> Option<(Signature, Pubkey, Pubkey)> {
-    // Helius Streams (transactionNotification)
-    // Detecta creación por log SPL: InitializeMint/InitializeMint2
     let result = v_get(msg, &["params", "result"])?;
 
-    // Firma
     let sig_str = result.get("signature").and_then(v_as_str)?;
     let sig = sig_str.parse::<Signature>().ok()?;
 
-    // ¿Es un initialize mint?
     let logs = v_get(result, &["transaction", "meta", "logMessages"])?.as_array()?;
     let is_mint_init = logs
         .iter()
@@ -193,7 +148,6 @@ fn parse_helius_stream_create(msg: &Value, _disc_create: &[u8; 8]) -> Option<(Si
         .any(|l| l.contains("Instruction: InitializeMint2") || l.contains("Instruction: InitializeMint"));
     if !is_mint_init { return None; }
 
-    // accountKeys: strings o {pubkey}
     let msg_root = v_get(result, &["transaction", "transaction", "message"]) 
         .or_else(|| v_get(result, &["transaction", "message"]))?;
     let account_keys_v = msg_root.get("accountKeys")?;
@@ -226,10 +180,8 @@ pub async fn run_ws_monitor(
     logger.log(format!("🔌 Conectando WS (Streams): {}", ws_url));
     logger.log(format!("ℹ️  PUMP_PROGRAM={}", PUMP_PROGRAM));
 
-    // Conectar
     let (mut ws, _resp) = connect_async(&ws_url).await.context("connect atlas WS")?;
 
-    // Suscribirse a transacciones que incluyan el programa Pump.fun
     let sub = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -264,25 +216,30 @@ pub async fn run_ws_monitor(
         let Ok(msg) = msg else { break };
         match msg {
             WsMessage::Text(txt) => {
-                // Ignora acks de suscripción sin "params"
                 let Ok(json): Result<Value, _> = serde_json::from_str(&txt) else { continue };
                 if json.get("method").and_then(|m| m.as_str()) != Some("transactionNotification") {
                     continue;
                 }
                 if let Some((sig, mint, creator)) = parse_helius_stream_create(&json, &disc_create) {
                     if seen_ws_set.contains(&sig) { continue; }
-                    if latency_log { logger.log(format!("[WS CREATE] mint={} creator={} sig={} | total={}ms", mint, creator, sig, (Instant::now() - t0).as_millis())); }
-                    else { logger.log(format!("[WS CREATE] mint={} creator={} sig={}", mint, creator, sig)); }
+                    if latency_log {
+                        logger.log(format!(
+                            "[WS CREATE] mint={} creator={} sig={} | total={}ms",
+                            mint,
+                            creator,
+                            sig,
+                            (Instant::now() - t0).as_millis()
+                        ));
+                    } else {
+                        logger.log(format!("[WS CREATE] mint={} creator={} sig={}", mint, creator, sig));
+                    }
                     let _ = handle_create_event_fast(rpc_nb.clone(), pump.clone(), mint, creator, logger).await;
                     seen_ws_set.insert(sig);
                     seen_ws.push_back(sig);
                     if seen_ws.len() > max_seen { if let Some(old) = seen_ws.pop_front() { seen_ws_set.remove(&old); } }
-                } else {
-                    // Debug opcional si no logra parsear (ver formato real)
-                    if env_bool("WS_DEBUG_RAW", false) {
-                        let preview = txt.chars().take(300).collect::<String>();
-                        logger.log(format!("[WS RAW] {}...", preview));
-                    }
+                } else if env_bool("WS_DEBUG_RAW", false) {
+                    let preview = txt.chars().take(300).collect::<String>();
+                    logger.log(format!("[WS RAW] {}...", preview));
                 }
             }
             WsMessage::Binary(_) => {}
